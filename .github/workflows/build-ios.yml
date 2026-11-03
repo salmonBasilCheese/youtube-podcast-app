@@ -17,7 +17,7 @@ jobs:
       - run: npm ci
 
       # ネイティブのiOSプロジェクトを生成(Podsのインストールも含む)
-      - run: npx expo prebuild --platform ios --no-install
+      - run: npx expo prebuild --platform ios
 
       - name: Build (署名なし)
         run: |
