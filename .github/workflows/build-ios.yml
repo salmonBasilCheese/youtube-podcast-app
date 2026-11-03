@@ -1,0 +1,45 @@
+name: Build unsigned iOS ipa
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # ネイティブのiOSプロジェクトを生成(Podsのインストールも含む)
+      - run: npx expo prebuild --platform ios --no-install
+
+      - name: Build (署名なし)
+        run: |
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -n 1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          xcodebuild archive \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath build/app.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package ipa
+        run: |
+          APP=$(ls -d build/app.xcarchive/Products/Applications/*.app | head -n 1)
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r app-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-unsigned-ipa
+          path: app-unsigned.ipa
+          retention-days: 14
