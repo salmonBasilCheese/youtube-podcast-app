@@ -43,3 +43,5 @@ jobs:
           name: app-unsigned-ipa
           path: app-unsigned.ipa
           retention-days: 14
+
+# 手動実行専用(Actions画面の Run workflow から起動)
