@@ -20,6 +20,19 @@ const KEEP_VISIBLE_JS = `
       document.addEventListener(t, function (e) { e.stopImmediatePropagation(); }, true);
     });
   } catch (e) {}
+  // ライブラリは倍速変更の命令を送るが、ページ側に受け取る処理がないため、ここで補う(最上位ページのみ)
+  try {
+    if (window.top === window) {
+      window.addEventListener('message', function (event) {
+        try {
+          var d = JSON.parse(event.data);
+          if (d.eventName === 'setPlaybackRate' && window.player && d.meta) {
+            window.player.setPlaybackRate(d.meta.playbackRate);
+          }
+        } catch (e) {}
+      });
+    }
+  } catch (e) {}
 })();
 true;
 `;
@@ -165,6 +178,7 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
           playList={ids.length > 1 ? ids.slice(1) : undefined}
           play={playing}
           playbackRate={rate}
+          onPlaybackRateChange={(r: number) => onRateChange(r)}
           onChangeState={onState}
           onError={(e: string) => addLog(`error: ${e}`)}
           webViewProps={{
