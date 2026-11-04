@@ -1,8 +1,26 @@
 // Phase 0: 画面オフでも音声が継続するかを実機で確認するための検証用画面
 import { useEffect, useState } from 'react';
 import { Button, Pressable, SafeAreaView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { setAudioModeAsync } from 'expo-audio';
+import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import YoutubeIframe from 'react-native-youtube-iframe';
+
+// 画面オフ時にページが「非表示」になりYouTubeが自動停止するのを防ぐため、
+// 常に「表示中・フォーカスあり」と見せかける(全フレームに読み込み前に注入)
+const KEEP_VISIBLE_JS = `
+(function () {
+  try {
+    Object.defineProperty(document, 'hidden', { get: function () { return false; }, configurable: true });
+    Object.defineProperty(document, 'visibilityState', { get: function () { return 'visible'; }, configurable: true });
+    Object.defineProperty(document, 'webkitHidden', { get: function () { return false; }, configurable: true });
+    document.hasFocus = function () { return true; };
+    ['visibilitychange', 'webkitvisibilitychange', 'pagehide', 'blur'].forEach(function (t) {
+      window.addEventListener(t, function (e) { e.stopImmediatePropagation(); }, true);
+      document.addEventListener(t, function (e) { e.stopImmediatePropagation(); }, true);
+    });
+  } catch (e) {}
+})();
+true;
+`;
 
 type Source = { videoId?: string; listId?: string };
 
@@ -28,7 +46,11 @@ export default function App() {
   const addLog = (s: string) =>
     setLog((l) => [`${new Date().toLocaleTimeString()} ${s}`, ...l].slice(0, 14));
 
+  // 無音をループ再生してアプリを「音声再生中」に保つ(バックグラウンドで止まりにくくする)
+  const keepAlive = useAudioPlayer(require('./assets/silence.wav'));
+
   useEffect(() => {
+    keepAlive.loop = true;
     setAudioModeAsync({
       playsInSilentMode: true,
       shouldPlayInBackground: true,
@@ -48,6 +70,8 @@ export default function App() {
     setSource(src);
     setLoadCount((c) => c + 1); // 読み込みのたびにプレーヤーを作り直す
     setPlaying(true);
+    keepAlive.play();
+    addLog('無音キープアライブ開始');
   };
 
   const hasSource = !!(source.videoId || source.listId);
@@ -74,13 +98,9 @@ export default function App() {
       </View>
 
       <View style={styles.row}>
-        {!hasSource ? (
-          <Button title="読み込んで再生" onPress={load} />
-        ) : (
-          <>
-            <Button title={playing ? '一時停止' : '再生'} onPress={() => setPlaying((p) => !p)} />
-            <Button title="別のURLを読み込む" onPress={load} />
-          </>
+        <Button title="読み込む" onPress={load} />
+        {hasSource && (
+          <Button title={playing ? '一時停止' : '再生'} onPress={() => setPlaying((p) => !p)} />
         )}
       </View>
 
@@ -100,7 +120,12 @@ export default function App() {
               if (s === 'ended' && !source.listId) setPlaying(false);
             }}
             onError={(e: string) => addLog(`error: ${e}`)}
-            webViewProps={{ allowsInlineMediaPlayback: true, mediaPlaybackRequiresUserAction: false }}
+            webViewProps={{
+              allowsInlineMediaPlayback: true,
+              mediaPlaybackRequiresUserAction: false,
+              injectedJavaScriptBeforeContentLoaded: KEEP_VISIBLE_JS,
+              injectedJavaScriptBeforeContentLoadedForMainFrameOnly: false,
+            }}
           />
         )}
       </View>
