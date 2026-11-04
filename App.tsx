@@ -1,6 +1,6 @@
 // Phase 0: 画面オフでも音声が継続するかを実機で確認するための検証用画面
-import { useEffect, useState } from 'react';
-import { Button, Pressable, SafeAreaView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useEffect, useRef, useState } from 'react';
+import { AppState, Button, Pressable, SafeAreaView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import YoutubeIframe from 'react-native-youtube-iframe';
 
@@ -60,7 +60,42 @@ export default function App() {
       .catch((e) => addLog(`audio mode error: ${e}`));
   }, []);
 
+  // 画面オフ(バックグラウンド移行)の直後に起きた一時停止だけ、自動で再開する。
+  // ロック画面などでユーザーが止めた場合(移行から時間が経っている)は再開しない。
+  const wantPlay = useRef(false); // ユーザーが「再生したい」状態か
+  const bgAt = useRef(0); // 最後にバックグラウンドへ移った時刻
+  const resumeAt = useRef(0); // 自動再開の操作をした時刻(自分の操作による停止を無視する)
+  const resumeTries = useRef(0);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (st) => {
+      if (st !== 'active') bgAt.current = Date.now();
+      else resumeTries.current = 0;
+      addLog(`app: ${st}`);
+    });
+    return () => sub.remove();
+  }, []);
+
+  const tryAutoResume = () => {
+    const now = Date.now();
+    if (!wantPlay.current) return;
+    if (now - bgAt.current > 3000) return; // 移行直後の停止ではない
+    if (now - resumeAt.current < 1500) return; // 自分の再開操作による停止
+    if (resumeTries.current >= 3) return;
+    resumeTries.current += 1;
+    resumeAt.current = now;
+    addLog(`自動再開 ${resumeTries.current}回目`);
+    setPlaying(false);
+    setTimeout(() => setPlaying(true), 400);
+  };
+
+  const togglePlay = () => {
+    wantPlay.current = !playing;
+    setPlaying(!playing);
+  };
+
   const load = () => {
+    wantPlay.current = true;
     const src = parseSource(input);
     if (!src.videoId && !src.listId) {
       addLog('URLを認識できません');
@@ -100,7 +135,7 @@ export default function App() {
       <View style={styles.row}>
         <Button title="読み込む" onPress={load} />
         {hasSource && (
-          <Button title={playing ? '一時停止' : '再生'} onPress={() => setPlaying((p) => !p)} />
+          <Button title={playing ? '一時停止' : '再生'} onPress={togglePlay} />
         )}
       </View>
 
@@ -117,7 +152,11 @@ export default function App() {
             onReady={() => addLog('player ready')}
             onChangeState={(s: string) => {
               addLog(`state: ${s}`);
-              if (s === 'ended' && !source.listId) setPlaying(false);
+              if (s === 'ended' && !source.listId) {
+                wantPlay.current = false;
+                setPlaying(false);
+              }
+              if (s === 'paused') tryAutoResume();
             }}
             onError={(e: string) => addLog(`error: ${e}`)}
             webViewProps={{
