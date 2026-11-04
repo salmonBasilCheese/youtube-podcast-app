@@ -1,26 +1,61 @@
 # YT Podcast
 
-YouTube内のPodcastを音声のみ・画面オフで聞く、個人用iPhoneアプリ(Expo / React Native)。
+YouTube上のPodcastを、**音声のみ・画面オフで**聞くための個人用iPhoneアプリ(Expo / React Native / TypeScript)。
 
-## ビルドと導入(Mac不要・無料)
-1. GitHub Actions の「Build unsigned iOS ipa」を手動実行 → 成果物 `app-unsigned-ipa` をダウンロード
-2. PCにApple Devices(Microsoft Store)とSideloadlyを入れ、iPhoneをUSB接続
-3. Sideloadlyで `app-unsigned.ipa` を無料Apple IDで署名してiPhoneへ導入
-4. iPhone: 設定 > 一般 > VPNとデバイス管理 でApple IDを信頼
-5. **7日ごとに** 手順3をやり直す(無料Apple IDの制限。同時に入れられる自作アプリは3本まで)
+## 作った理由
+ブラウザでYouTubeのPodcastをバックグラウンド再生していたが、動画やおすすめが目に入り、つい時間を浪費していた。
+動画機能を省き、Podcastの一覧と再生だけに絞ったアプリを自作した。
 
-## 使い方
-1. 初回のみ、ホーム画面にYouTube Data API v3のキーを入力(端末内にだけ保存。リポジトリには含めない)
-2. 「Podcast一覧を開く」→ 再生リスト → エピソードを選ぶ(選んだ回から後ろが順に再生される)
-3. 再生が始まらないときは、プレーヤーのサムネイルを一度タップ
-4. 画面オフで止まったら、ロック画面の再生ボタンを押す(その後は画面オフのまま連続再生される)
-5. 次回は、ホームの「続きから再生」で、最後に聞いた動画の位置から再開できる
+## できること
+- チャンネルのPodcast(再生リスト)とエピソードの一覧表示(タイトルのみ)
+- 再生 / 一時停止、±15秒スキップ、倍速(0.75〜2.0)、スリープタイマー(15/30/60分)
+- 画面オフのままの連続再生(再生リストの次のエピソードへ自動で進む)
+- 動画ごとの再生位置の記憶と、「続きから再生」(アプリを閉じても保存)
+- 動画URL・再生リストURLの直接再生
+
+## 技術構成
+| 項目 | 内容 |
+| --- | --- |
+| アプリ | Expo (React Native) + TypeScript |
+| 再生 | YouTube公式IFrame Player(`react-native-youtube-iframe`)を使用 |
+| 一覧取得 | YouTube Data API v3(公式) |
+| 保存 | AsyncStorage(設定・再生位置・最後に聞いた動画。端末内のみ) |
+| ビルド | GitHub Actions(macOS)で署名なし.ipaを生成 → Sideloadlyで署名・導入 |
+
+構成: `App.tsx`(画面遷移・一覧) / `src/PlayerScreen.tsx`(再生) / `src/api.ts`(YouTube Data API) / `src/storage.ts`(保存)
+
+## 工夫した点・課題解決
+- **Macなし・無料でのiOS導入**: EAS BuildのiOSは有料のApple Developer Programが前提のため、GitHub ActionsのmacOS環境で署名なし.ipaを作り、無料Apple IDでSideloadly署名する方式にした(7日ごとに再署名が必要)。
+- **画面オフ再生**: バックグラウンド音声の許可、無音ループの再生によるアプリの維持、ページの「非表示」判定の無効化で、画面オフ後も再生が続くようにした。
+- **ライブラリの不具合回避**: 使用ライブラリが倍速変更の命令を受け取れない問題を、注入スクリプトで補った(`src/PlayerScreen.tsx`)。
+- **キーの扱い**: APIキーはコードやビルドに含めず、アプリ内で入力して端末にだけ保存する。公開リポジトリ・ビルド成果物に残らない。
 
 ## 既知の制限
-- 画面オフ直後に一度止まる(iOSの仕様。アプリ側の自動再開は効果がなかった)
+- 画面オフ直後に一度止まる(iOSの仕様)。ロック画面の再生ボタンを押すと再開し、その後は連続再生される
 - 次へ/前へボタンは未実装(エピソード一覧から選び直す)
 - 再生リストは最大100本まで連続再生
+- YouTube側の仕様変更で動かなくなる可能性がある
 
-## 開発メモ
-- 構成: `App.tsx`(画面遷移・一覧) / `src/PlayerScreen.tsx`(再生) / `src/api.ts`(YouTube Data API) / `src/storage.ts`(設定・再生位置)
-- ライブラリ `react-native-youtube-iframe` は倍速変更の命令を受ける処理が欠けているため、`PlayerScreen.tsx` の注入スクリプトで補っている
+## YouTubeの規約について
+- 再生はYouTube公式の埋め込みプレーヤー(IFrame Player)のみを使用している
+- 音声ストリームの抽出、広告の回避、ダウンロードは行っていない
+- 映像は画面に表示される(最初の再生開始時にプレーヤーのタップが必要なため)
+- 個人利用が目的で、App Storeでは配布しない
+
+## ビルドと導入(Mac不要・無料)
+1. GitHub Actions の「Build unsigned iOS ipa」を手動実行し、成果物 `app-unsigned-ipa` をダウンロード
+2. PCにApple Devices(Microsoft Store)とSideloadlyを入れ、iPhoneをUSB接続
+3. Sideloadlyで `app-unsigned.ipa` を無料Apple IDで署名してiPhoneへ導入
+4. iPhone: 設定 > 一般 > VPNとデバイス管理 でApple IDを信頼。設定 > プライバシーとセキュリティ でデベロッパモードをオン
+5. **7日ごとに** 手順3をやり直す(無料Apple IDの制限。同時に入れられる自作アプリは3本まで)
+6. スクリーンタイムで「Appのインストール」が禁止されていると導入に失敗する
+
+## 使い方
+1. 初回のみ、ホーム画面にYouTube Data API v3のキーを入力(端末内にだけ保存)
+2. 「Podcast一覧を開く」→ 再生リスト → エピソードを選ぶ(選んだ回から後ろが順に再生される)
+3. 再生が始まらないときは、プレーヤーのサムネイルを一度タップ
+4. 画面オフで止まったら、ロック画面の再生ボタンを押す
+5. 次回は、ホームの「続きから再生」で、最後に聞いた動画の位置から再開できる
+
+## ライセンス
+MIT License
