@@ -1,23 +1,32 @@
 // Phase 0: 画面オフでも音声が継続するかを実機で確認するための検証用画面
 import { useEffect, useState } from 'react';
-import { Button, SafeAreaView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Button, Pressable, SafeAreaView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { setAudioModeAsync } from 'expo-audio';
 import YoutubeIframe from 'react-native-youtube-iframe';
 
-// YouTubeのURLまたは11文字の動画IDから動画IDを取り出す
-function extractVideoId(input: string): string {
-  const m = input.match(/(?:v=|youtu\.be\/|embed\/)([\w-]{11})/);
-  return m ? m[1] : input.trim();
+type Source = { videoId?: string; listId?: string };
+
+// YouTubeのURLから動画ID・プレイリストIDを取り出す(11文字の動画IDだけの入力も可)
+function parseSource(input: string): Source {
+  const s = input.trim();
+  const list = s.match(/[?&]list=([\w-]+)/)?.[1];
+  const video = s.match(/(?:[?&]v=|youtu\.be\/|embed\/|shorts\/)([\w-]{11})/)?.[1];
+  if (list) return { listId: list, videoId: video };
+  if (video) return { videoId: video };
+  if (/^[\w-]{11}$/.test(s)) return { videoId: s };
+  if (/^(PL|UU|OL|FL|RD)[\w-]+$/.test(s)) return { listId: s };
+  return {};
 }
 
 export default function App() {
   const [input, setInput] = useState('');
-  const [videoId, setVideoId] = useState('');
+  const [source, setSource] = useState<Source>({});
+  const [loadCount, setLoadCount] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [log, setLog] = useState<string[]>([]);
 
   const addLog = (s: string) =>
-    setLog((l) => [`${new Date().toLocaleTimeString()} ${s}`, ...l].slice(0, 12));
+    setLog((l) => [`${new Date().toLocaleTimeString()} ${s}`, ...l].slice(0, 14));
 
   useEffect(() => {
     setAudioModeAsync({
@@ -29,39 +38,60 @@ export default function App() {
       .catch((e) => addLog(`audio mode error: ${e}`));
   }, []);
 
+  const load = () => {
+    const src = parseSource(input);
+    if (!src.videoId && !src.listId) {
+      addLog('URLを認識できません');
+      return;
+    }
+    addLog(`読込 video=${src.videoId ?? '-'} list=${src.listId ?? '-'}`);
+    setSource(src);
+    setLoadCount((c) => c + 1); // 読み込みのたびにプレーヤーを作り直す
+    setPlaying(true);
+  };
+
+  const hasSource = !!(source.videoId || source.listId);
+
   return (
     <SafeAreaView style={styles.container}>
       <Text style={styles.title}>Phase 0: 画面オフ再生テスト</Text>
-      <TextInput
-        style={styles.input}
-        placeholder="YouTubeのURLか動画ID"
-        placeholderTextColor="#888"
-        value={input}
-        onChangeText={setInput}
-        autoCapitalize="none"
-      />
-      <Button
-        title="読み込み"
-        onPress={() => {
-          setVideoId(extractVideoId(input));
-          setPlaying(false);
-        }}
-      />
+
+      <View style={styles.inputWrap}>
+        <TextInput
+          style={styles.input}
+          placeholder="YouTubeの動画/プレイリストURL"
+          placeholderTextColor="#888"
+          value={input}
+          onChangeText={setInput}
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        {input !== '' && (
+          <Pressable style={styles.clear} onPress={() => setInput('')} hitSlop={10}>
+            <Text style={styles.clearText}>×</Text>
+          </Pressable>
+        )}
+      </View>
+
+      <Button title="読み込んで再生" onPress={load} />
       <View style={styles.row}>
         <Button title={playing ? '一時停止' : '再生'} onPress={() => setPlaying((p) => !p)} />
       </View>
 
-      {/* 映像は非表示(高さ1px)。音声だけを使う */}
-      <View style={styles.hidden}>
-        {videoId !== '' && (
+      {/* 映像は透明にして見えなくする(YouTubeは200px未満だと再生を拒否するため大きさは確保) */}
+      <View style={styles.hidden} pointerEvents="none">
+        {hasSource && (
           <YoutubeIframe
-            height={1}
-            width={1}
-            videoId={videoId}
+            key={loadCount}
+            height={200}
+            width={200}
+            videoId={source.listId ? undefined : source.videoId}
+            playList={source.listId}
             play={playing}
+            onReady={() => addLog('player ready')}
             onChangeState={(s: string) => {
               addLog(`state: ${s}`);
-              if (s === 'ended') setPlaying(false);
+              if (s === 'ended' && !source.listId) setPlaying(false);
             }}
             onError={(e: string) => addLog(`error: ${e}`)}
             webViewProps={{ allowsInlineMediaPlayback: true, mediaPlaybackRequiresUserAction: false }}
@@ -80,9 +110,21 @@ export default function App() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#111', padding: 16, gap: 8 },
   title: { color: '#fff', fontSize: 18, marginTop: 24 },
-  input: { backgroundColor: '#222', color: '#fff', padding: 10, borderRadius: 6 },
+  inputWrap: { justifyContent: 'center' },
+  input: { backgroundColor: '#222', color: '#fff', padding: 10, paddingRight: 40, borderRadius: 6 },
+  clear: {
+    position: 'absolute',
+    right: 6,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#555',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  clearText: { color: '#fff', fontSize: 18, lineHeight: 20 },
   row: { flexDirection: 'row', justifyContent: 'center' },
-  hidden: { height: 1, width: 1, opacity: 0.01, overflow: 'hidden' },
+  hidden: { position: 'absolute', top: 0, left: 0, width: 200, height: 200, opacity: 0.01 },
   sub: { color: '#aaa', marginTop: 12 },
   log: { color: '#ccc', fontSize: 12 },
 });
