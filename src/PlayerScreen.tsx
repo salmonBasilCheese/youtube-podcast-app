@@ -1,10 +1,10 @@
 // プレーヤー画面: 再生/一時停止・±15秒・倍速・スリープタイマー・再生位置の記憶
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, SafeAreaView, ScrollView, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import YoutubeIframe, { YoutubeIframeRef } from 'react-native-youtube-iframe';
 import type { Episode } from './api';
-import { clearPosition, loadPosition, savePosition } from './storage';
+import { clearPosition, loadPosition, saveLast, savePosition } from './storage';
 
 // 画面オフ時にページが「非表示」になりYouTubeが自動停止するのを防ぐため、
 // 常に「表示中・フォーカスあり」と見せかける(全フレームに読み込み前に注入)
@@ -39,6 +39,9 @@ type Props = {
 const videoIdFromUrl = (url: string) => url.match(/[?&]v=([\w-]{11})/)?.[1];
 
 export default function PlayerScreen({ queue, startIndex, rate, onRateChange, onBack }: Props) {
+  const { width: screenW } = useWindowDimensions();
+  const playerW = screenW - 32; // 左右の余白16pxずつ
+  const playerH = Math.round((playerW * 9) / 16);
   const ids = queue.slice(startIndex, startIndex + MAX_QUEUE).map((e) => e.id);
   const titleOf = (id?: string) => queue.find((e) => e.id === id)?.title ?? '';
 
@@ -65,6 +68,11 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
     }).catch((e) => addLog(`audio mode error: ${e}`));
     return () => keepAlive.pause();
   }, []);
+
+  // 今どの動画を聞いているかを保存(次回「続きから再生」で使う)
+  useEffect(() => {
+    if (currentId) saveLast({ queue, currentId });
+  }, [currentId]);
 
   // 5秒ごとに再生位置を保存し、再生中の動画IDを追従する
   useEffect(() => {
@@ -137,7 +145,8 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
   const fmt = (sec: number) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
 
   return (
-    <SafeAreaView style={s.container}>
+    <SafeAreaView style={s.safe}>
+      <ScrollView contentContainerStyle={s.container}>
       <Pressable onPress={onBack} hitSlop={10}>
         <Text style={s.back}>← 戻る</Text>
       </Pressable>
@@ -147,11 +156,11 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
       </Text>
 
       {/* 映像は小さなサムネイル程度。最初の1回だけ、中央の再生ボタンを直接タップして再生を始める */}
-      <View style={s.player}>
+      <View style={{ width: playerW, height: playerH, alignSelf: 'center' }}>
         <YoutubeIframe
           ref={playerRef}
-          height={200}
-          width={200}
+          height={playerH}
+          width={playerW}
           videoId={ids[0]}
           playList={ids.length > 1 ? ids.slice(1) : undefined}
           play={playing}
@@ -196,6 +205,7 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
       {log.map((l, i) => (
         <Text key={i} style={s.log}>{l}</Text>
       ))}
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -217,18 +227,18 @@ function Chip({ label, active, onPress }: { label: string; active: boolean; onPr
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#111', padding: 16, gap: 10 },
-  back: { color: '#6cf', fontSize: 16, marginTop: 24 },
-  title: { color: '#fff', fontSize: 17, fontWeight: '600' },
-  player: { width: 200, height: 200, alignSelf: 'center' },
-  hint: { color: '#888', fontSize: 11, textAlign: 'center' },
-  row: { flexDirection: 'row', gap: 8, justifyContent: 'center', flexWrap: 'wrap' },
-  label: { color: '#aaa', marginTop: 6 },
-  btn: { backgroundColor: '#2a2a2a', paddingVertical: 12, paddingHorizontal: 18, borderRadius: 8 },
-  btnWide: { paddingHorizontal: 28, backgroundColor: '#1d5fd8' },
-  btnText: { color: '#fff', fontSize: 16 },
-  chip: { backgroundColor: '#2a2a2a', paddingVertical: 8, paddingHorizontal: 14, borderRadius: 16 },
+  safe: { flex: 1, backgroundColor: '#111' },
+  container: { padding: 16, gap: 12 },
+  back: { color: '#6cf', fontSize: 18, marginTop: 24, paddingVertical: 6 },
+  title: { color: '#fff', fontSize: 18, fontWeight: '600' },
+  hint: { color: '#888', fontSize: 12, textAlign: 'center' },
+  row: { flexDirection: 'row', gap: 10, justifyContent: 'center', flexWrap: 'wrap' },
+  label: { color: '#aaa', marginTop: 8, fontSize: 14 },
+  btn: { backgroundColor: '#2a2a2a', paddingVertical: 18, paddingHorizontal: 22, borderRadius: 10 },
+  btnWide: { paddingHorizontal: 30, backgroundColor: '#1d5fd8' },
+  btnText: { color: '#fff', fontSize: 20 },
+  chip: { backgroundColor: '#2a2a2a', paddingVertical: 14, paddingHorizontal: 18, borderRadius: 22 },
   chipActive: { backgroundColor: '#1d5fd8' },
-  chipText: { color: '#fff' },
+  chipText: { color: '#fff', fontSize: 17 },
   log: { color: '#777', fontSize: 11 },
 });

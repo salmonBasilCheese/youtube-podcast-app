@@ -12,7 +12,15 @@ import {
 } from 'react-native';
 import { findChannelId, listEpisodes, listPlaylists, Episode, Playlist } from './src/api';
 import PlayerScreen from './src/PlayerScreen';
-import { DEFAULT_SETTINGS, loadSettings, saveSettings, Settings } from './src/storage';
+import {
+  DEFAULT_SETTINGS,
+  LastSession,
+  loadLast,
+  loadPositions,
+  loadSettings,
+  saveSettings,
+  Settings,
+} from './src/storage';
 
 type Screen =
   | { name: 'home' }
@@ -44,6 +52,18 @@ export default function App() {
       setReady(true);
     });
   }, []);
+
+  // ホームに戻るたびに「続きから再生」用の記録を読み直す
+  const [last, setLast] = useState<LastSession | null>(null);
+  useEffect(() => {
+    if (screen.name === 'home') loadLast().then(setLast);
+  }, [screen.name]);
+
+  const resumeLast = () => {
+    if (!last) return;
+    const idx = Math.max(0, last.queue.findIndex((e) => e.id === last.currentId));
+    setScreen({ name: 'player', queue: last.queue, startIndex: idx, back: { name: 'home' } });
+  };
 
   const update = (patch: Partial<Settings>) => {
     const next = { ...settings, ...patch };
@@ -152,19 +172,11 @@ export default function App() {
           <Text style={s.back}>← 戻る</Text>
         </Pressable>
         <Text style={s.title} numberOfLines={2}>{here.playlist.title}</Text>
-        <FlatList
-          data={here.items}
-          keyExtractor={(e) => e.id}
-          renderItem={({ item, index }) => (
-            <Pressable
-              style={s.row}
-              onPress={() =>
-                setScreen({ name: 'player', queue: here.items, startIndex: index, back: here })
-              }
-            >
-              <Text style={s.rowTitle} numberOfLines={2}>{item.title}</Text>
-            </Pressable>
-          )}
+        <EpisodeList
+          items={here.items}
+          onPick={(index) =>
+            setScreen({ name: 'player', queue: here.items, startIndex: index, back: here })
+          }
         />
       </SafeAreaView>
     );
@@ -174,6 +186,15 @@ export default function App() {
   return (
     <SafeAreaView style={s.container}>
       <Text style={s.title}>YT Podcast</Text>
+
+      {last && (
+        <Pressable style={s.resume} onPress={resumeLast}>
+          <Text style={s.resumeLabel}>続きから再生</Text>
+          <Text style={s.resumeTitle} numberOfLines={1}>
+            {last.queue.find((e) => e.id === last.currentId)?.title ?? ''}
+          </Text>
+        </Pressable>
+      )}
 
       <Text style={s.label}>YouTube Data API キー(この端末にだけ保存)</Text>
       <Field
@@ -202,6 +223,29 @@ export default function App() {
       {busy && <ActivityIndicator color="#fff" style={{ marginTop: 12 }} />}
       {error !== '' && <Text style={s.error}>{error}</Text>}
     </SafeAreaView>
+  );
+}
+
+// エピソード一覧(タイトルのみ・1行で省略表示)。途中まで聞いた回は位置を表示する
+function EpisodeList({ items, onPick }: { items: Episode[]; onPick: (index: number) => void }) {
+  const [pos, setPos] = useState<Record<string, number>>({});
+  useEffect(() => {
+    loadPositions(items.map((e) => e.id)).then(setPos);
+  }, [items]);
+
+  const fmt = (sec: number) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+
+  return (
+    <FlatList
+      data={items}
+      keyExtractor={(e) => e.id}
+      renderItem={({ item, index }) => (
+        <Pressable style={s.row} onPress={() => onPick(index)}>
+          <Text style={s.rowTitle} numberOfLines={1} ellipsizeMode="tail">{item.title}</Text>
+          {pos[item.id] > 5 && <Text style={s.rowSub}>途中: {fmt(pos[item.id])} まで</Text>}
+        </Pressable>
+      )}
+    />
   );
 }
 
@@ -257,4 +301,7 @@ const s = StyleSheet.create({
   rowTitle: { color: '#fff', fontSize: 15 },
   rowSub: { color: '#888', fontSize: 12, marginTop: 2 },
   error: { color: '#f66', marginTop: 8 },
+  resume: { backgroundColor: '#1f3a1f', padding: 14, borderRadius: 10, marginTop: 8 },
+  resumeLabel: { color: '#8f8', fontSize: 13 },
+  resumeTitle: { color: '#fff', fontSize: 16, marginTop: 4 },
 });
