@@ -1,185 +1,243 @@
-// Phase 0: 画面オフでも音声が継続するかを実機で確認するための検証用画面
-import { useEffect, useRef, useState } from 'react';
-import { AppState, Button, Pressable, SafeAreaView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
-import YoutubeIframe from 'react-native-youtube-iframe';
+// YT Podcast: ホーム(設定・URL再生) → 再生リスト(Podcast)一覧 → エピソード一覧 → プレーヤー
+import { useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  FlatList,
+  Pressable,
+  SafeAreaView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import { findChannelId, listEpisodes, listPlaylists, Episode, Playlist } from './src/api';
+import PlayerScreen from './src/PlayerScreen';
+import { DEFAULT_SETTINGS, loadSettings, saveSettings, Settings } from './src/storage';
 
-// 画面オフ時にページが「非表示」になりYouTubeが自動停止するのを防ぐため、
-// 常に「表示中・フォーカスあり」と見せかける(全フレームに読み込み前に注入)
-const KEEP_VISIBLE_JS = `
-(function () {
-  try {
-    Object.defineProperty(document, 'hidden', { get: function () { return false; }, configurable: true });
-    Object.defineProperty(document, 'visibilityState', { get: function () { return 'visible'; }, configurable: true });
-    Object.defineProperty(document, 'webkitHidden', { get: function () { return false; }, configurable: true });
-    document.hasFocus = function () { return true; };
-    ['visibilitychange', 'webkitvisibilitychange', 'pagehide', 'blur'].forEach(function (t) {
-      window.addEventListener(t, function (e) { e.stopImmediatePropagation(); }, true);
-      document.addEventListener(t, function (e) { e.stopImmediatePropagation(); }, true);
-    });
-  } catch (e) {}
-})();
-true;
-`;
+type Screen =
+  | { name: 'home' }
+  | { name: 'playlists'; items: Playlist[] }
+  | { name: 'episodes'; playlist: Playlist; items: Episode[]; playlists: Playlist[] }
+  | { name: 'player'; queue: Episode[]; startIndex: number; back: Screen };
 
-type Source = { videoId?: string; listId?: string };
-
-// YouTubeのURLから動画ID・プレイリストIDを取り出す(11文字の動画IDだけの入力も可)
-function parseSource(input: string): Source {
+// YouTubeのURLから動画ID・再生リストIDを取り出す
+function parseUrl(input: string): { videoId?: string; listId?: string } {
   const s = input.trim();
-  const list = s.match(/[?&]list=([\w-]+)/)?.[1];
-  const video = s.match(/(?:[?&]v=|youtu\.be\/|embed\/|shorts\/)([\w-]{11})/)?.[1];
-  if (list) return { listId: list, videoId: video };
-  if (video) return { videoId: video };
-  if (/^[\w-]{11}$/.test(s)) return { videoId: s };
-  if (/^(PL|UU|OL|FL|RD)[\w-]+$/.test(s)) return { listId: s };
-  return {};
+  const listId = s.match(/[?&]list=([\w-]+)/)?.[1];
+  const videoId =
+    s.match(/(?:[?&]v=|youtu\.be\/|embed\/|shorts\/)([\w-]{11})/)?.[1] ??
+    (/^[\w-]{11}$/.test(s) ? s : undefined);
+  return { listId, videoId };
 }
 
 export default function App() {
-  const [input, setInput] = useState('');
-  const [source, setSource] = useState<Source>({});
-  const [loadCount, setLoadCount] = useState(0);
-  const [playing, setPlaying] = useState(false);
-  const [log, setLog] = useState<string[]>([]);
-
-  const addLog = (s: string) =>
-    setLog((l) => [`${new Date().toLocaleTimeString()} ${s}`, ...l].slice(0, 14));
-
-  // 無音をループ再生してアプリを「音声再生中」に保つ(バックグラウンドで止まりにくくする)
-  const keepAlive = useAudioPlayer(require('./assets/silence.wav'));
+  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
+  const [ready, setReady] = useState(false);
+  const [screen, setScreen] = useState<Screen>({ name: 'home' });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [url, setUrl] = useState('');
 
   useEffect(() => {
-    keepAlive.loop = true;
-    setAudioModeAsync({
-      playsInSilentMode: true,
-      shouldPlayInBackground: true,
-      interruptionMode: 'doNotMix',
-    })
-      .then(() => addLog('audio mode set'))
-      .catch((e) => addLog(`audio mode error: ${e}`));
-  }, []);
-
-  // 画面オフ(バックグラウンド移行)の直後に起きた一時停止だけ、自動で再開する。
-  // ロック画面などでユーザーが止めた場合(移行から時間が経っている)は再開しない。
-  const wantPlay = useRef(false); // ユーザーが「再生したい」状態か
-  const bgAt = useRef(0); // 最後にバックグラウンドへ移った時刻
-  const resumeAt = useRef(0); // 自動再開の操作をした時刻(自分の操作による停止を無視する)
-  const resumeTries = useRef(0);
-
-  useEffect(() => {
-    const sub = AppState.addEventListener('change', (st) => {
-      if (st !== 'active') bgAt.current = Date.now();
-      else resumeTries.current = 0;
-      addLog(`app: ${st}`);
+    loadSettings().then((s) => {
+      setSettings(s);
+      setReady(true);
     });
-    return () => sub.remove();
   }, []);
 
-  const tryAutoResume = () => {
-    const now = Date.now();
-    if (!wantPlay.current) return;
-    if (now - bgAt.current > 3000) return; // 移行直後の停止ではない
-    if (now - resumeAt.current < 1500) return; // 自分の再開操作による停止
-    if (resumeTries.current >= 3) return;
-    resumeTries.current += 1;
-    resumeAt.current = now;
-    addLog(`自動再開 ${resumeTries.current}回目`);
-    setPlaying(false);
-    setTimeout(() => setPlaying(true), 400);
+  const update = (patch: Partial<Settings>) => {
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    saveSettings(next);
   };
 
-  const togglePlay = () => {
-    wantPlay.current = !playing;
-    setPlaying(!playing);
-  };
-
-  const load = () => {
-    wantPlay.current = true;
-    const src = parseSource(input);
-    if (!src.videoId && !src.listId) {
-      addLog('URLを認識できません');
-      return;
+  // 通信を伴う処理の共通ラッパー(ローディング表示とエラー表示)
+  const run = async (fn: () => Promise<void>) => {
+    setError('');
+    setBusy(true);
+    try {
+      await fn();
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
     }
-    addLog(`読込 video=${src.videoId ?? '-'} list=${src.listId ?? '-'}`);
-    setSource(src);
-    setLoadCount((c) => c + 1); // 読み込みのたびにプレーヤーを作り直す
-    setPlaying(true);
-    keepAlive.play();
-    addLog('無音キープアライブ開始');
   };
 
-  const hasSource = !!(source.videoId || source.listId);
+  const needKey = () => {
+    if (!settings.apiKey.trim()) throw new Error('先にAPIキーを入力してください');
+    return settings.apiKey.trim();
+  };
 
-  return (
-    <SafeAreaView style={styles.container}>
-      <Text style={styles.title}>Phase 0: 画面オフ再生テスト</Text>
+  const loadChannel = () =>
+    run(async () => {
+      const key = needKey();
+      const channelId = await findChannelId(settings.handle, key);
+      const items = await listPlaylists(channelId, key);
+      if (items.length === 0) throw new Error('再生リストが見つかりません');
+      setScreen({ name: 'playlists', items });
+    });
 
-      <View style={styles.inputWrap}>
-        <TextInput
-          style={styles.input}
-          placeholder="YouTubeの動画/プレイリストURL"
-          placeholderTextColor="#888"
-          value={input}
-          onChangeText={setInput}
-          autoCapitalize="none"
-          autoCorrect={false}
+  const openPlaylist = (p: Playlist, playlists: Playlist[]) =>
+    run(async () => {
+      const items = await listEpisodes(p.id, needKey());
+      setScreen({ name: 'episodes', playlist: p, items, playlists });
+    });
+
+  const playUrl = () =>
+    run(async () => {
+      const { listId, videoId } = parseUrl(url);
+      if (listId) {
+        const items = await listEpisodes(listId, needKey());
+        const idx = Math.max(0, items.findIndex((e) => e.id === videoId));
+        setScreen({ name: 'player', queue: items, startIndex: idx, back: { name: 'home' } });
+      } else if (videoId) {
+        setScreen({
+          name: 'player',
+          queue: [{ id: videoId, title: '動画' }],
+          startIndex: 0,
+          back: { name: 'home' },
+        });
+      } else {
+        throw new Error('URLを認識できません');
+      }
+    });
+
+  if (!ready) return <View style={s.container} />;
+
+  if (screen.name === 'player') {
+    return (
+      <PlayerScreen
+        queue={screen.queue}
+        startIndex={screen.startIndex}
+        rate={settings.rate}
+        onRateChange={(rate) => update({ rate })}
+        onBack={() => setScreen(screen.back)}
+      />
+    );
+  }
+
+  if (screen.name === 'playlists') {
+    const here = screen;
+    return (
+      <SafeAreaView style={s.container}>
+        <Pressable onPress={() => setScreen({ name: 'home' })} hitSlop={10}>
+          <Text style={s.back}>← 戻る</Text>
+        </Pressable>
+        <Text style={s.title}>Podcast / 再生リスト</Text>
+        {busy && <ActivityIndicator color="#fff" />}
+        {error !== '' && <Text style={s.error}>{error}</Text>}
+        <FlatList
+          data={here.items}
+          keyExtractor={(p) => p.id}
+          renderItem={({ item }) => (
+            <Pressable style={s.row} onPress={() => openPlaylist(item, here.items)}>
+              <Text style={s.rowTitle}>{item.title}</Text>
+              <Text style={s.rowSub}>{item.count}本</Text>
+            </Pressable>
+          )}
         />
-        {input !== '' && (
-          <Pressable style={styles.clear} onPress={() => setInput('')} hitSlop={10}>
-            <Text style={styles.clearText}>×</Text>
-          </Pressable>
-        )}
-      </View>
+      </SafeAreaView>
+    );
+  }
 
-      <View style={styles.row}>
-        <Button title="読み込む" onPress={load} />
-        {hasSource && (
-          <Button title={playing ? '一時停止' : '再生'} onPress={togglePlay} />
-        )}
-      </View>
-
-      {/* 診断中: プレーヤーを表示している(原因特定後に透明化する) */}
-      <View style={styles.hidden}>
-        {hasSource && (
-          <YoutubeIframe
-            key={loadCount}
-            height={200}
-            width={200}
-            videoId={source.listId ? undefined : source.videoId}
-            playList={source.listId}
-            play={playing}
-            onReady={() => addLog('player ready')}
-            onChangeState={(s: string) => {
-              addLog(`state: ${s}`);
-              if (s === 'ended' && !source.listId) {
-                wantPlay.current = false;
-                setPlaying(false);
+  if (screen.name === 'episodes') {
+    const here = screen;
+    return (
+      <SafeAreaView style={s.container}>
+        <Pressable
+          onPress={() => setScreen({ name: 'playlists', items: here.playlists })}
+          hitSlop={10}
+        >
+          <Text style={s.back}>← 戻る</Text>
+        </Pressable>
+        <Text style={s.title} numberOfLines={2}>{here.playlist.title}</Text>
+        <FlatList
+          data={here.items}
+          keyExtractor={(e) => e.id}
+          renderItem={({ item, index }) => (
+            <Pressable
+              style={s.row}
+              onPress={() =>
+                setScreen({ name: 'player', queue: here.items, startIndex: index, back: here })
               }
-              if (s === 'paused') tryAutoResume();
-            }}
-            onError={(e: string) => addLog(`error: ${e}`)}
-            webViewProps={{
-              allowsInlineMediaPlayback: true,
-              mediaPlaybackRequiresUserAction: false,
-              injectedJavaScriptBeforeContentLoaded: KEEP_VISIBLE_JS,
-              injectedJavaScriptBeforeContentLoadedForMainFrameOnly: false,
-            }}
-          />
-        )}
-      </View>
+            >
+              <Text style={s.rowTitle} numberOfLines={2}>{item.title}</Text>
+            </Pressable>
+          )}
+        />
+      </SafeAreaView>
+    );
+  }
 
-      <Text style={styles.sub}>ログ(新しい順)</Text>
-      {log.map((l, i) => (
-        <Text key={i} style={styles.log}>{l}</Text>
-      ))}
+  // ホーム
+  return (
+    <SafeAreaView style={s.container}>
+      <Text style={s.title}>YT Podcast</Text>
+
+      <Text style={s.label}>YouTube Data API キー(この端末にだけ保存)</Text>
+      <Field
+        value={settings.apiKey}
+        onChangeText={(apiKey) => update({ apiKey })}
+        placeholder="AIza..."
+        secure
+      />
+
+      <Text style={s.label}>チャンネルのハンドル</Text>
+      <Field
+        value={settings.handle}
+        onChangeText={(handle) => update({ handle })}
+        placeholder="@チャンネル名"
+      />
+      <Pressable style={s.primary} onPress={loadChannel}>
+        <Text style={s.primaryText}>Podcast一覧を開く</Text>
+      </Pressable>
+
+      <Text style={[s.label, { marginTop: 16 }]}>URLを直接再生(動画 / 再生リスト)</Text>
+      <Field value={url} onChangeText={setUrl} placeholder="https://www.youtube.com/..." />
+      <Pressable style={s.primary} onPress={playUrl}>
+        <Text style={s.primaryText}>再生画面へ</Text>
+      </Pressable>
+
+      {busy && <ActivityIndicator color="#fff" style={{ marginTop: 12 }} />}
+      {error !== '' && <Text style={s.error}>{error}</Text>}
     </SafeAreaView>
   );
 }
 
-const styles = StyleSheet.create({
+// ワンタップで消せる「×」付きの入力欄
+function Field(props: {
+  value: string;
+  onChangeText: (t: string) => void;
+  placeholder: string;
+  secure?: boolean;
+}) {
+  return (
+    <View style={s.inputWrap}>
+      <TextInput
+        style={s.input}
+        value={props.value}
+        onChangeText={props.onChangeText}
+        placeholder={props.placeholder}
+        placeholderTextColor="#777"
+        autoCapitalize="none"
+        autoCorrect={false}
+        secureTextEntry={props.secure}
+      />
+      {props.value !== '' && (
+        <Pressable style={s.clear} onPress={() => props.onChangeText('')} hitSlop={10}>
+          <Text style={s.clearText}>×</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#111', padding: 16, gap: 8 },
-  title: { color: '#fff', fontSize: 18, marginTop: 24 },
+  title: { color: '#fff', fontSize: 20, fontWeight: '700', marginTop: 8 },
+  back: { color: '#6cf', fontSize: 16, marginTop: 24 },
+  label: { color: '#aaa', fontSize: 13, marginTop: 8 },
   inputWrap: { justifyContent: 'center' },
   input: { backgroundColor: '#222', color: '#fff', padding: 10, paddingRight: 40, borderRadius: 6 },
   clear: {
@@ -193,8 +251,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   clearText: { color: '#fff', fontSize: 18, lineHeight: 20 },
-  row: { flexDirection: 'row', justifyContent: 'center', gap: 16 },
-  hidden: { width: 200, height: 200, alignSelf: 'center' },
-  sub: { color: '#aaa', marginTop: 12 },
-  log: { color: '#ccc', fontSize: 12 },
+  primary: { backgroundColor: '#1d5fd8', padding: 12, borderRadius: 8, alignItems: 'center' },
+  primaryText: { color: '#fff', fontSize: 16 },
+  row: { paddingVertical: 12, borderBottomColor: '#2a2a2a', borderBottomWidth: 1 },
+  rowTitle: { color: '#fff', fontSize: 15 },
+  rowSub: { color: '#888', fontSize: 12, marginTop: 2 },
+  error: { color: '#f66', marginTop: 8 },
 });
