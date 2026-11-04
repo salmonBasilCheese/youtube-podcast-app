@@ -73,13 +73,19 @@ export default function App() {
         )}
       </View>
 
-      <Button title="読み込んで再生" onPress={load} />
       <View style={styles.row}>
-        <Button title={playing ? '一時停止' : '再生'} onPress={() => setPlaying((p) => !p)} />
+        {!hasSource ? (
+          <Button title="読み込んで再生" onPress={load} />
+        ) : (
+          <>
+            <Button title={playing ? '一時停止' : '再生'} onPress={() => setPlaying((p) => !p)} />
+            <Button title="別のURLを読み込む" onPress={load} />
+          </>
+        )}
       </View>
 
-      {/* 映像は透明にして見えなくする(YouTubeは200px未満だと再生を拒否するため大きさは確保) */}
-      <View style={styles.hidden} pointerEvents="none">
+      {/* 診断中: プレーヤーを表示している(原因特定後に透明化する) */}
+      <View style={styles.hidden}>
         {hasSource && (
           <YoutubeIframe
             key={loadCount}
@@ -123,8 +129,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   clearText: { color: '#fff', fontSize: 18, lineHeight: 20 },
-  row: { flexDirection: 'row', justifyContent: 'center' },
-  hidden: { position: 'absolute', top: 0, left: 0, width: 200, height: 200, opacity: 0.01 },
+  row: { flexDirection: 'row', justifyContent: 'center', gap: 16 },
+  hidden: { width: 200, height: 200, alignSelf: 'center' },
   sub: { color: '#aaa', marginTop: 12 },
   log: { color: '#ccc', fontSize: 12 },
 });
