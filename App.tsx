@@ -5,19 +5,33 @@ import {
   FlatList,
   Pressable,
   SafeAreaView,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
-import { findChannelId, listEpisodes, listPlaylists, Episode, Playlist } from './src/api';
+import {
+  findChannelId,
+  getPlaylistTitle,
+  listEpisodes,
+  listLatestVideos,
+  listPlaylists,
+  normalizeHandle,
+  Episode,
+  Playlist,
+} from './src/api';
 import PlayerScreen from './src/PlayerScreen';
 import {
+  addRecent,
   DEFAULT_SETTINGS,
   LastSession,
+  loadDiagLogs,
   loadLast,
   loadPositions,
+  loadRecents,
   loadSettings,
+  Recent,
   saveSettings,
   Settings,
 } from './src/storage';
@@ -25,7 +39,7 @@ import {
 type Screen =
   | { name: 'home' }
   | { name: 'playlists'; items: Playlist[] }
-  | { name: 'episodes'; playlist: Playlist; items: Episode[]; playlists: Playlist[] }
+  | { name: 'episodes'; title: string; items: Episode[]; back: Screen }
   | { name: 'player'; queue: Episode[]; startIndex: number; back: Screen };
 
 // YouTubeのURLから動画ID・再生リストIDを取り出す
@@ -55,9 +69,19 @@ export default function App() {
 
   // ホームに戻るたびに「続きから再生」用の記録を読み直す
   const [last, setLast] = useState<LastSession | null>(null);
+  const [recents, setRecents] = useState<Recent[]>([]);
+  const [logs, setLogs] = useState<string[] | null>(null); // nullなら診断ログは閉じている
   useEffect(() => {
-    if (screen.name === 'home') loadLast().then(setLast);
+    if (screen.name === 'home') {
+      loadLast().then(setLast);
+      loadRecents().then(setRecents);
+    }
   }, [screen.name]);
+
+  const toggleLogs = () => {
+    if (logs) setLogs(null);
+    else loadDiagLogs().then(setLogs);
+  };
 
   const resumeLast = () => {
     if (!last) return;
@@ -89,28 +113,59 @@ export default function App() {
     return settings.apiKey.trim();
   };
 
+  // チャンネルの再生リスト一覧(成功したらチャンネルを履歴に残す)
   const loadChannel = () =>
     run(async () => {
       const key = needKey();
       const channelId = await findChannelId(settings.handle, key);
       const items = await listPlaylists(channelId, key);
       if (items.length === 0) throw new Error('再生リストが見つかりません');
+      setRecents(await addRecent({ kind: 'channel', handle: normalizeHandle(settings.handle) }));
       setScreen({ name: 'playlists', items });
+    });
+
+  // チャンネルの最新動画50件(ショート除外)
+  const loadLatest = () =>
+    run(async () => {
+      const key = needKey();
+      const channelId = await findChannelId(settings.handle, key);
+      const items = await listLatestVideos(channelId, key, 50);
+      setRecents(await addRecent({ kind: 'channel', handle: normalizeHandle(settings.handle) }));
+      setScreen({ name: 'episodes', title: '最新動画', items, back: { name: 'home' } });
     });
 
   const openPlaylist = (p: Playlist, playlists: Playlist[]) =>
     run(async () => {
       const items = await listEpisodes(p.id, needKey());
-      setScreen({ name: 'episodes', playlist: p, items, playlists });
+      setScreen({
+        name: 'episodes',
+        title: p.title,
+        items,
+        back: { name: 'playlists', items: playlists },
+      });
     });
+
+  // 再生リストIDから直接エピソード一覧を開く(URL入力・履歴から)
+  const fetchPlaylist = async (id: string, knownTitle?: string) => {
+    const key = needKey();
+    const [title, items] = await Promise.all([
+      knownTitle ? Promise.resolve(knownTitle) : getPlaylistTitle(id, key),
+      listEpisodes(id, key),
+    ]);
+    setRecents(await addRecent({ kind: 'playlist', id, title }));
+    setScreen({ name: 'episodes', title, items, back: { name: 'home' } });
+  };
+
+  const pickRecent = (r: Recent) => {
+    if (r.kind === 'channel') update({ handle: r.handle });
+    else run(() => fetchPlaylist(r.id, r.title));
+  };
 
   const playUrl = () =>
     run(async () => {
       const { listId, videoId } = parseUrl(url);
       if (listId) {
-        const items = await listEpisodes(listId, needKey());
-        const idx = Math.max(0, items.findIndex((e) => e.id === videoId));
-        setScreen({ name: 'player', queue: items, startIndex: idx, back: { name: 'home' } });
+        await fetchPlaylist(listId);
       } else if (videoId) {
         setScreen({
           name: 'player',
@@ -165,13 +220,10 @@ export default function App() {
     const here = screen;
     return (
       <SafeAreaView style={s.container}>
-        <Pressable
-          onPress={() => setScreen({ name: 'playlists', items: here.playlists })}
-          hitSlop={10}
-        >
+        <Pressable onPress={() => setScreen(here.back)} hitSlop={10}>
           <Text style={s.back}>← 戻る</Text>
         </Pressable>
-        <Text style={s.title} numberOfLines={2}>{here.playlist.title}</Text>
+        <Text style={s.title} numberOfLines={2}>{here.title}</Text>
         <EpisodeList
           items={here.items}
           onPick={(index) =>
@@ -185,6 +237,7 @@ export default function App() {
   // ホーム
   return (
     <SafeAreaView style={s.container}>
+      <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ gap: 8 }}>
       <Text style={s.title}>YT Podcast</Text>
 
       {last && (
@@ -210,18 +263,45 @@ export default function App() {
         onChangeText={(handle) => update({ handle })}
         placeholder="@チャンネル名"
       />
-      <Pressable style={s.primary} onPress={loadChannel}>
-        <Text style={s.primaryText}>Podcast一覧を開く</Text>
-      </Pressable>
+      <View style={s.btnRow}>
+        <Pressable style={[s.primary, s.flex1]} onPress={loadChannel}>
+          <Text style={s.primaryText}>再生リスト一覧</Text>
+        </Pressable>
+        <Pressable style={[s.primary, s.flex1]} onPress={loadLatest}>
+          <Text style={s.primaryText}>最新動画50件</Text>
+        </Pressable>
+      </View>
 
-      <Text style={[s.label, { marginTop: 16 }]}>URLを直接再生(動画 / 再生リスト)</Text>
+      {recents.length > 0 && (
+        <>
+          <Text style={s.label}>最近開いたもの(タップで選択)</Text>
+          {recents.map((r, i) => (
+            <Pressable key={i} style={s.recent} onPress={() => pickRecent(r)}>
+              <Text style={s.recentKind}>{r.kind === 'channel' ? 'チャンネル' : '再生リスト'}</Text>
+              <Text style={s.recentText} numberOfLines={1}>
+                {r.kind === 'channel' ? r.handle : r.title}
+              </Text>
+            </Pressable>
+          ))}
+        </>
+      )}
+
+      <Text style={[s.label, { marginTop: 16 }]}>URLを開く(再生リスト → 一覧 / 動画 → 再生)</Text>
       <Field value={url} onChangeText={setUrl} placeholder="https://www.youtube.com/..." />
       <Pressable style={s.primary} onPress={playUrl}>
-        <Text style={s.primaryText}>再生画面へ</Text>
+        <Text style={s.primaryText}>開く</Text>
       </Pressable>
 
       {busy && <ActivityIndicator color="#fff" style={{ marginTop: 12 }} />}
       {error !== '' && <Text style={s.error}>{error}</Text>}
+
+      <Pressable onPress={toggleLogs} hitSlop={10}>
+        <Text style={[s.label, { marginTop: 24 }]}>{logs ? '▼ 診断ログを閉じる' : '▶ 診断ログ'}</Text>
+      </Pressable>
+      {logs && (logs.length === 0
+        ? <Text style={s.log}>ログはありません</Text>
+        : logs.map((l, i) => <Text key={i} style={s.log}>{l}</Text>))}
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -304,4 +384,18 @@ const s = StyleSheet.create({
   resume: { backgroundColor: '#1f3a1f', padding: 14, borderRadius: 10, marginTop: 8 },
   resumeLabel: { color: '#8f8', fontSize: 13 },
   resumeTitle: { color: '#fff', fontSize: 16, marginTop: 4 },
+  btnRow: { flexDirection: 'row', gap: 8 },
+  flex1: { flex: 1 },
+  recent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#1a1a1a',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+  },
+  recentKind: { color: '#6cf', fontSize: 11 },
+  recentText: { color: '#fff', fontSize: 14, flex: 1 },
+  log: { color: '#777', fontSize: 11 },
 });

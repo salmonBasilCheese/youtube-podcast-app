@@ -70,6 +70,62 @@ export async function loadPositions(ids: string[]): Promise<Record<string, numbe
   }
 }
 
+// 直近に開いたチャンネル/プレイリストの履歴(最大10件・重複なし)
+export type Recent =
+  | { kind: 'channel'; handle: string }
+  | { kind: 'playlist'; id: string; title: string };
+const RECENTS_KEY = 'recents';
+const MAX_RECENTS = 10;
+
+const sameRecent = (a: Recent, b: Recent) =>
+  a.kind === 'channel' && b.kind === 'channel'
+    ? a.handle.toLowerCase() === b.handle.toLowerCase()
+    : a.kind === 'playlist' && b.kind === 'playlist' && a.id === b.id;
+
+export async function loadRecents(): Promise<Recent[]> {
+  try {
+    const raw = await AsyncStorage.getItem(RECENTS_KEY);
+    return raw ? (JSON.parse(raw) as Recent[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+// 先頭に追加し、同じ項目は除いて10件に切る。更新後の一覧を返す
+export async function addRecent(r: Recent): Promise<Recent[]> {
+  const next = [r, ...(await loadRecents()).filter((x) => !sameRecent(x, r))].slice(0, MAX_RECENTS);
+  try {
+    await AsyncStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+  } catch {}
+  return next;
+}
+
+// 診断ログ(直近50件)。アプリを閉じても残り、再生トラブルの原因調べに使う
+const LOG_KEY = 'diaglog';
+const MAX_LOGS = 50;
+let logQueue: Promise<void> = Promise.resolve();
+
+export function appendDiagLog(line: string): void {
+  logQueue = logQueue.then(async () => {
+    try {
+      const raw = await AsyncStorage.getItem(LOG_KEY);
+      const logs: string[] = raw ? JSON.parse(raw) : [];
+      logs.unshift(`${new Date().toLocaleString()} ${line}`);
+      await AsyncStorage.setItem(LOG_KEY, JSON.stringify(logs.slice(0, MAX_LOGS)));
+    } catch {}
+  });
+}
+
+export async function loadDiagLogs(): Promise<string[]> {
+  try {
+    await logQueue;
+    const raw = await AsyncStorage.getItem(LOG_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
 export async function clearPosition(videoId: string): Promise<void> {
   try {
     await AsyncStorage.removeItem(POS_PREFIX + videoId);

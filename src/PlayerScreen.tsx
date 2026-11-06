@@ -1,10 +1,10 @@
 // プレーヤー画面: 再生/一時停止・±15秒・倍速・スリープタイマー・再生位置の記憶
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Pressable, SafeAreaView, ScrollView, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { AppState, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import YoutubeIframe, { YoutubeIframeRef } from 'react-native-youtube-iframe';
 import type { Episode } from './api';
-import { clearPosition, loadPosition, saveLast, savePosition } from './storage';
+import { appendDiagLog, clearPosition, loadPosition, saveLast, savePosition } from './storage';
 
 // 画面オフ時にページが「非表示」になりYouTubeが自動停止するのを防ぐため、
 // 常に「表示中・フォーカスあり」と見せかける(全フレームに読み込み前に注入)
@@ -51,11 +51,35 @@ type Props = {
 
 const videoIdFromUrl = (url: string) => url.match(/[?&]v=([\w-]{11})/)?.[1];
 
+// 応答しないプレーヤーを待ち続けないための時間切れ付き待機
+const withTimeout = <T,>(p: Promise<T>, ms: number): Promise<T> =>
+  new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), ms);
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
+  });
+
+// 他アプリの音を止めず・自分も止められにくい設定(通知などで音量が下がったままになるのを避ける)
+const applyAudioMode = () =>
+  setAudioModeAsync({
+    playsInSilentMode: true,
+    shouldPlayInBackground: true,
+    interruptionMode: 'mixWithOthers',
+  });
+
+const AUTO_RESUME_WINDOW_MS = 3000; // 画面オフなどでアプリを離れてから、この間の停止だけ自動で再開する
+const MAX_AUTO_RESUMES = 3;
+const PLAY_RESPONSE_MS = 5000; // 再生ボタンを押してから反応を待つ時間
+
 export default function PlayerScreen({ queue, startIndex, rate, onRateChange, onBack }: Props) {
   const { width: screenW } = useWindowDimensions();
   const playerW = screenW - 32; // 左右の余白16pxずつ
   const playerH = Math.round((playerW * 9) / 16);
-  const ids = queue.slice(startIndex, startIndex + MAX_QUEUE).map((e) => e.id);
+  const [baseIndex, setBaseIndex] = useState(startIndex); // 作り直し時は聞いている回から組み直す
+  const [webKey, setWebKey] = useState(0); // 変えるとWebView(プレーヤー)が作り直される
+  const ids = queue.slice(baseIndex, baseIndex + MAX_QUEUE).map((e) => e.id);
   const titleOf = (id?: string) => queue.find((e) => e.id === id)?.title ?? '';
 
   const playerRef = useRef<YoutubeIframeRef>(null);
@@ -66,21 +90,118 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
   const [log, setLog] = useState<string[]>([]);
   const resumedFor = useRef<string | null>(null);
 
-  const addLog = (s: string) =>
+  // persist=true なら端末にも残す(ホームの診断ログで後から見られる)
+  const addLog = (s: string, persist = false) => {
     setLog((l) => [`${new Date().toLocaleTimeString()} ${s}`, ...l].slice(0, 8));
+    if (persist) appendDiagLog(s);
+  };
 
   // 無音をループ再生してアプリを「音声再生中」に保つ(バックグラウンドで止まりにくくする)
   const keepAlive = useAudioPlayer(require('../assets/silence.wav'));
+  const keepAliveRef = useRef(keepAlive);
+  keepAliveRef.current = keepAlive;
   useEffect(() => {
     keepAlive.loop = true;
     keepAlive.play();
-    setAudioModeAsync({
-      playsInSilentMode: true,
-      shouldPlayInBackground: true,
-      interruptionMode: 'doNotMix',
-    }).catch((e) => addLog(`audio mode error: ${e}`));
+    applyAudioMode().catch((e) => addLog(`audio mode error: ${e}`, true));
     return () => keepAlive.pause();
   }, []);
+
+  // --- 再生の安定化 ---
+  const currentIdRef = useRef(currentId);
+  currentIdRef.current = currentId;
+  const wantPlay = useRef(true); // 本人が再生を望んでいるか
+  const lastState = useRef('unstarted'); // プレーヤーが最後に報告した状態
+  const readyRef = useRef(false); // プレーヤーの読み込みが終わったか
+  const leftAt = useRef(0); // アプリが前面から離れた時刻
+  const autoResumes = useRef(0);
+  const recovering = useRef(false);
+  const isPlayingState = () => lastState.current === 'playing' || lastState.current === 'buffering';
+
+  // プレーヤーを作り直し、音声セッションも張り直す(放置後に再生できなくなったときの復旧)
+  const recover = async (reason: string) => {
+    if (recovering.current) return;
+    recovering.current = true;
+    addLog(`復旧: ${reason}`, true);
+    try {
+      await applyAudioMode();
+    } catch (e) {
+      addLog(`復旧中のaudio mode error: ${e}`, true);
+    }
+    try {
+      keepAliveRef.current.play();
+    } catch {}
+    const idx = queue.findIndex((e) => e.id === currentIdRef.current);
+    if (idx >= 0) setBaseIndex(idx);
+    readyRef.current = false;
+    lastState.current = 'unstarted';
+    resumedFor.current = null; // 作り直したあとも保存位置から再開する
+    wantPlay.current = true;
+    setPlaying(true);
+    setWebKey((k) => k + 1);
+    setTimeout(() => { recovering.current = false; }, 3000);
+  };
+  const recoverRef = useRef(recover);
+  recoverRef.current = recover;
+
+  // プレーヤーが応答するか確認する(応答なしならWebViewが止まっている)
+  const probe = async () => {
+    try {
+      await withTimeout(playerRef.current!.getCurrentTime(), 3000);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // 前面/背面の切り替えを監視する
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', async (st) => {
+      if (st !== 'active') {
+        leftAt.current = Date.now();
+        return;
+      }
+      if (!keepAliveRef.current.playing) {
+        keepAliveRef.current.play();
+        addLog('前面復帰: 無音ループを再開', true);
+      }
+      if (!readyRef.current) return;
+      if (!(await probe())) {
+        recoverRef.current('前面復帰時にプレーヤーが応答なし');
+        return;
+      }
+      // 音量低下の切り分け用に、プレーヤー側の音量・ミュート状態を記録する
+      try {
+        const [vol, muted] = await Promise.all([
+          withTimeout(playerRef.current!.getVolume(), 2000),
+          withTimeout(playerRef.current!.isMuted(), 2000),
+        ]);
+        addLog(`前面復帰: 状態=${lastState.current} 音量=${vol} ミュート=${muted}`, true);
+      } catch {}
+    });
+    return () => sub.remove();
+  }, []);
+
+  // 再生ボタン: 見かけ上は再生中でも実際は止まっているときは、押し直しで再生をやり直す
+  const togglePlay = () => {
+    if (playing && isPlayingState()) {
+      wantPlay.current = false;
+      setPlaying(false);
+      return;
+    }
+    wantPlay.current = true;
+    if (playing) {
+      setPlaying(false);
+      setTimeout(() => setPlaying(true), 100);
+    } else {
+      setPlaying(true);
+    }
+    setTimeout(() => {
+      if (wantPlay.current && !isPlayingState() && readyRef.current) {
+        recoverRef.current('再生ボタンを押しても再生が始まらない');
+      }
+    }, PLAY_RESPONSE_MS);
+  };
 
   // 今どの動画を聞いているかを保存(次回「続きから再生」で使う)
   useEffect(() => {
@@ -90,6 +211,13 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
   // 5秒ごとに再生位置を保存し、再生中の動画IDを追従する
   useEffect(() => {
     const t = setInterval(async () => {
+      // 割り込み(通知・通話など)で止まった無音ループを再開する
+      try {
+        if (!keepAliveRef.current.playing) {
+          keepAliveRef.current.play();
+          addLog('無音ループが止まっていたため再開', true);
+        }
+      } catch {}
       try {
         const url = await playerRef.current?.getVideoUrl();
         const id = url ? videoIdFromUrl(url) : undefined;
@@ -117,6 +245,7 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
       const left = Math.max(0, Math.round((endAt - Date.now()) / 1000));
       setSleepLeft(left);
       if (left === 0) {
+        wantPlay.current = false;
         setPlaying(false);
         setSleepMin(0);
         addLog('スリープタイマーで停止');
@@ -126,8 +255,11 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
   }, [sleepMin]);
 
   const onState = useCallback(async (s: string) => {
-    addLog(`state: ${s}`);
+    lastState.current = s;
+    addLog(`state: ${s}`, s === 'playing' || s === 'paused');
     if (s === 'playing') {
+      wantPlay.current = true;
+      autoResumes.current = 0;
       setPlaying(true);
       // 動画ごとに最初の1回だけ、保存済みの位置から再開する
       try {
@@ -145,6 +277,14 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
       } catch {}
     } else if (s === 'paused') {
       setPlaying(false);
+      // 画面オフ直後の停止だけ自動で再開する(ロック画面での一時停止などは対象外)
+      if (wantPlay.current && Date.now() - leftAt.current < AUTO_RESUME_WINDOW_MS) {
+        if (autoResumes.current < MAX_AUTO_RESUMES) {
+          autoResumes.current += 1;
+          addLog(`画面オフ直後の停止を検知: 自動再開 ${autoResumes.current}回目`, true);
+          setTimeout(() => setPlaying(true), 500);
+        }
+      }
     }
   }, []);
 
@@ -171,6 +311,7 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
       {/* 映像は小さなサムネイル程度。最初の1回だけ、中央の再生ボタンを直接タップして再生を始める */}
       <View style={{ width: playerW, height: playerH, alignSelf: 'center' }}>
         <YoutubeIframe
+          key={webKey}
           ref={playerRef}
           height={playerH}
           width={playerW}
@@ -180,10 +321,16 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
           playbackRate={rate}
           onPlaybackRateChange={(r: number) => onRateChange(r)}
           onChangeState={onState}
-          onError={(e: string) => addLog(`error: ${e}`)}
+          onReady={() => {
+            readyRef.current = true;
+            addLog('プレーヤー準備完了');
+          }}
+          onError={(e: string) => addLog(`error: ${e}`, true)}
           webViewProps={{
             allowsInlineMediaPlayback: true,
             mediaPlaybackRequiresUserAction: false,
+            useSharedProcessPool: false, // 作り直しのとき、止まった古いWebプロセスを引き継がない
+            onContentProcessDidTerminate: () => recoverRef.current('WebViewのプロセスが終了'),
             injectedJavaScriptBeforeContentLoaded: KEEP_VISIBLE_JS,
             injectedJavaScriptBeforeContentLoadedForMainFrameOnly: false,
           }}
@@ -193,8 +340,11 @@ export default function PlayerScreen({ queue, startIndex, rate, onRateChange, on
 
       <View style={s.row}>
         <Btn label="⟲ 15" onPress={() => skip(-15)} />
-        <Btn label={playing ? '⏸ 一時停止' : '▶ 再生'} onPress={() => setPlaying((p) => !p)} wide />
+        <Btn label={playing ? '⏸ 一時停止' : '▶ 再生'} onPress={togglePlay} wide />
         <Btn label="15 ⟳" onPress={() => skip(15)} />
+      </View>
+      <View style={s.row}>
+        <Chip label="⟳ 読み込み直す" active={false} onPress={() => recover('手動')} />
       </View>
 
       <Text style={s.label}>倍速</Text>
